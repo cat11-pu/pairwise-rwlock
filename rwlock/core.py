@@ -110,12 +110,14 @@ class RWLock:
             self._write_depth += 1
             return True
         if owner in self._readers:
-            if self._writer is None:
+            if self._pending(owner) is not None:
+                return False
+            if (self._writer is None and not self._queue
+                    and set(self._readers) == {owner}):
                 self._readers.pop(owner)
                 self._writer = owner
                 self._write_depth = 1
                 return True
-            self._readers.pop(owner)
             self._enqueue(owner, UPGRADE, timeout)
             return False
         if self._pending(owner) is not None:
@@ -134,6 +136,10 @@ class RWLock:
         owner = _key(owner)
         if owner not in self._readers:
             raise LockError("持有者 %s 没有持有该资源的读锁" % (owner,))
+        remaining = self._readers[owner] - 1
+        if remaining > 0:
+            self._readers[owner] = remaining
+            return remaining
         del self._readers[owner]
         self._drop_pending(owner)
         self._dispatch()
@@ -144,8 +150,10 @@ class RWLock:
         owner = _key(owner)
         if self._writer != owner:
             raise LockError("持有者 %s 没有持有该资源的写锁" % (owner,))
+        self._write_depth -= 1
+        if self._write_depth > 0:
+            return self._write_depth
         self._writer = None
-        self._write_depth = 0
         self._dispatch()
         return 0
 
@@ -156,8 +164,9 @@ class RWLock:
             raise LockError("持有者 %s 没有持有该资源的写锁" % (owner,))
         self._writer = None
         self._write_depth = 0
+        self._readers[owner] = self._readers.get(owner, 0) + 1
         self._dispatch()
-        return self._readers.get(owner, 0)
+        return self._readers[owner]
 
     # --------------------------------------------------------------- 时钟
 
@@ -169,13 +178,14 @@ class RWLock:
         self.clock.advance(ticks)
         now = self.clock.now()
         expired = []
-        while self._queue:
-            head = self._queue[0]
-            if head.deadline is None or head.deadline > now:
-                break
-            waiter = self._queue.pop(0)
+        kept = []
+        for waiter in self._queue:
+            if waiter.deadline is None or waiter.deadline > now:
+                kept.append(waiter)
+                continue
             expired.append((waiter.owner, waiter.kind))
         if expired:
+            self._queue = kept
             self._expired.extend(expired)
             self._dispatch()
         return expired
@@ -224,8 +234,8 @@ class RWLock:
         return True
 
     def _read_should_wait(self):
-        """这次读请求是否必须排队：写者正持有锁的时候要排队。"""
-        return self._writer is not None
+        """这次读请求是否必须排队：写者正持有锁、或队列里已有人在等的时候。"""
+        return self._writer is not None or bool(self._queue)
 
     def _enqueue(self, owner, kind, timeout):
         """把请求按到达顺序放进队列，并记下它的到期刻度。"""
@@ -236,8 +246,8 @@ class RWLock:
     def _dispatch(self):
         """试着把队列里的请求授予出去，返回本次授予的 (持有者, 类型) 列表。"""
         granted = []
-        remaining = []
-        for waiter in self._queue:
+        while self._queue:
+            waiter = self._queue[0]
             if waiter.kind == READ and self._writer is None:
                 self._readers[waiter.owner] = self._readers.get(waiter.owner, 0) + 1
                 granted.append((waiter.owner, READ))
@@ -252,6 +262,6 @@ class RWLock:
                 self._write_depth = 1
                 granted.append((waiter.owner, WRITE))
             else:
-                remaining.append(waiter)
-        self._queue = remaining
+                break
+            self._queue.pop(0)
         return granted
